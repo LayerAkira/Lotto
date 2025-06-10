@@ -68,3 +68,10 @@ Integrates with **Pragma VRF** for secure randomness and **ERC20** for fee handl
   2. Upon callback, calculates winner based on ticket weight.
   3. Owner can then call `draw` to finalize the draw.
   4. Emits `Drawn` event with winner details.
+
+---
+
+## Usage
+
+- **Sepolia**:
+  - Deployed @ [0x0052a213c5128c841c49df6f8748556c60d871b45a6c835aecd5c549d618e836](https://sepolia.voyager.online/contract/0x0052a213c5128c841c49df6f8748556c60d871b45a6c835aecd5c549d618e836)

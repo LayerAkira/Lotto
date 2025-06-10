@@ -118,7 +118,7 @@ mod AkiLottoDrawer {
 
     #[derive(Drop, starknet::Event)]
     pub struct DoubleOrNothingEvent {
-        pub winner: ContractAddress,
+        pub user: ContractAddress,
         pub tickets: u256,
         pub won: bool,
     }
@@ -158,14 +158,26 @@ mod AkiLottoDrawer {
         self.owner.read()
     }
 
+    fn _check_and_push_user(ref self: ContractState, user: ContractAddress) {
+        let len = self.user_list.len();
+        let mut found = false;
+        for i in 0_u64..len {
+            if self.user_list.at(i).read() == user {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            self.user_list.push(user);
+        }
+    }
+
     #[abi(embed_v0)]
     impl AkiLottoDrawerImpl of IAkiLottoDrawer<ContractState> {
         fn add_wallet(ref self: ContractState) -> bool {
             let caller = get_caller_address();
             let user = self.user_info.entry(caller).read();
-            if user.tickets == 0 {
-                self.user_list.push(caller);
-            }
+            _check_and_push_user(ref self, caller);
 
             let updated_user = UserInfo {
                 tickets: user.tickets, is_connected: true, has_spinned: false,
@@ -207,6 +219,8 @@ mod AkiLottoDrawer {
 
         fn add_tickets(ref self: ContractState, user: ContractAddress, tickets: u256) {
             assert!(get_caller_address() == self.owner.read(), "Only owner can add tickets");
+            assert!(tickets > 0, "Tickets to add must be greater than zero");
+            _check_and_push_user(ref self, user);
 
             let mut user_info = self.user_info.entry(user).read();
 
@@ -217,6 +231,7 @@ mod AkiLottoDrawer {
 
         fn remove_tickets(ref self: ContractState, user: ContractAddress, tickets: u256) {
             assert!(get_caller_address() == self.owner.read(), "Only owner can remove tickets");
+            assert!(tickets > 0, "Tickets to remove must be greater than zero");
 
             let mut user_info = self.user_info.entry(user).read();
 
@@ -235,6 +250,7 @@ mod AkiLottoDrawer {
             assert!(get_caller_address() == self.owner.read(), "Only owner can draw");
             assert!(self.total_tickets.read() > 0, "No tickets to draw");
             assert!(self.draw_random_word.read() != 0, "No Random Number Yet");
+            assert!(self.user_list.len() > 0, "No users to draw from");
 
             _draw_winner(ref self)
         }
@@ -278,7 +294,7 @@ mod AkiLottoDrawer {
         caller_info.tickets = tickets;
         self.user_info.entry(caller).write(caller_info);
 
-        self.emit(DoubleOrNothingEvent { winner: caller, tickets: caller_info.tickets, won: win });
+        self.emit(DoubleOrNothingEvent { user: caller, tickets: caller_info.tickets, won: win });
         self.user_spin_random.entry(caller).write(0);
         win
     }
