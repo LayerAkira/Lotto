@@ -354,6 +354,11 @@ mod AkiLottoDrawer {
             calldata: Array<felt252>,
         ) {
             assert!(get_caller_address() == self.owner.read(), "Only owner can request randomness");
+            assert!(!self.has_drawed.read(), "Draw has already been done");
+            assert!(callback_fee_limit > 0, "Callback fee limit must be greater than zero");
+            assert!(publish_delay > 0, "Publish delay must be greater than zero");
+            assert!(num_words > 0, "Number of words must be greater than zero");
+
             if let Some(x) = calldata.get(0) {
                 let user: felt252 = *x.unbox();
                 assert!(
