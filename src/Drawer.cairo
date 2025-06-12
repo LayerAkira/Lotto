@@ -300,21 +300,30 @@ mod AkiLottoDrawer {
     }
 
     fn _draw_winner(ref self: ContractState) -> (ContractAddress, u256) {
-        let total_tickets = self.total_tickets.read();
+        let mut connected_user = array![];
+        let mut total_tickets = 0_u256;
+        for i in 0_u64..self.user_list.len() {
+            let addr: ContractAddress = self.user_list.at(i).read();
+            let user_info: UserInfo = self.user_info.entry(addr).read();
+            if user_info.is_connected {
+                connected_user.append(addr);
+                total_tickets += user_info.tickets;
+            }
+        }
+
+        assert!(total_tickets > 0_u256, "No connected users with tickets");
+        assert!(connected_user.len() > 0, "No connected users to draw from");
 
         let random: u256 = self.draw_random_word.read().into();
         let r: u256 = (random % total_tickets).try_into().unwrap();
 
         let mut cumulative = 0_u256;
-        let len = self.user_list.len();
-        let mut i = 0_u64;
+        let len = connected_user.len();
+        let mut i = 0_u32;
 
         let mut res: (ContractAddress, u256) = (self.owner.read(), 0_u256);
-        loop {
-            if i >= len {
-                break;
-            }
-            let addr: ContractAddress = self.user_list.at(i).read();
+        while i != len {
+            let addr: ContractAddress = *connected_user.at(i);
             let user_info: UserInfo = self.user_info.entry(addr).read();
             cumulative += user_info.tickets;
             if cumulative > r {
