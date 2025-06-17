@@ -15,7 +15,7 @@ pub struct DoubleOrNothingConfig {
 
 #[starknet::interface]
 pub trait IPragmaVRF<TContractState> {
-    fn get_spin_random_word(self: @TContractState) -> felt252;
+    fn get_spin_random_word(self: @TContractState, user: ContractAddress) -> felt252;
     fn get_draw_random_word(self: @TContractState) -> felt252;
     fn request_randomness_from_pragma(
         ref self: TContractState,
@@ -349,9 +349,8 @@ mod AkiLottoDrawer {
             last_random
         }
 
-        fn get_spin_random_word(self: @ContractState) -> felt252 {
-            let caller = get_caller_address();
-            self.user_spin_random.entry(caller).read()
+        fn get_spin_random_word(self: @ContractState, user: ContractAddress) -> felt252 {
+            self.user_spin_random.entry(user).read()
         }
 
         fn request_randomness_from_pragma(
