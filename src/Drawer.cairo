@@ -361,17 +361,31 @@ mod AkiLottoDrawer {
             num_words: u64,
             calldata: Array<felt252>,
         ) {
-            assert!(get_caller_address() == self.owner.read(), "Only owner can request randomness");
+            //assert!(get_caller_address() == self.owner.read(), "Only owner can request
+            //randomness");
             assert!(!self.has_drawed.read(), "Draw has already been done");
             assert!(callback_fee_limit > 0, "Callback fee limit must be greater than zero");
             assert!(publish_delay > 0, "Publish delay must be greater than zero");
             assert!(num_words > 0, "Number of words must be greater than zero");
+            assert!(
+                callback_address == get_contract_address(),
+                "Callback address should be this contract address",
+            );
 
+            assert!(
+                !self.user_info.entry(get_caller_address()).read().has_spinned,
+                "User has already spun for double or nothing",
+            );
             if let Some(x) = calldata.get(0) {
                 let user: felt252 = *x.unbox();
                 assert!(
-                    !self.user_info.entry(user.try_into().unwrap()).read().has_spinned,
-                    "User has already spun for double or nothing",
+                    user.try_into().unwrap() == get_caller_address(),
+                    "User address in calldata does not match caller address",
+                );
+            } else {
+                assert!(
+                    get_caller_address() == self.owner.read(),
+                    "Only owner can request randomness without user address",
                 );
             }
 
@@ -382,7 +396,8 @@ mod AkiLottoDrawer {
 
             let eth_dispatcher = ERC20ABIDispatcher { contract_address: self.eth_address.read() };
             eth_dispatcher
-                .approve(
+                .transferFrom(
+                    get_caller_address(),
                     randomness_contract_address,
                     (callback_fee_limit + callback_fee_limit / 5).into(),
                 );
