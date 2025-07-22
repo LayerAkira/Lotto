@@ -361,8 +361,6 @@ mod AkiLottoDrawer {
             num_words: u64,
             calldata: Array<felt252>,
         ) {
-            //assert!(get_caller_address() == self.owner.read(), "Only owner can request
-            //randomness");
             assert!(!self.has_drawed.read(), "Draw has already been done");
             assert!(callback_fee_limit > 0, "Callback fee limit must be greater than zero");
             assert!(publish_delay > 0, "Publish delay must be greater than zero");
@@ -395,12 +393,12 @@ mod AkiLottoDrawer {
             };
 
             let eth_dispatcher = ERC20ABIDispatcher { contract_address: self.eth_address.read() };
+            let total_fee = callback_fee_limit + callback_fee_limit / 5;
+            // first transfer the callback fee from caller to this contract
             eth_dispatcher
-                .transferFrom(
-                    get_caller_address(),
-                    randomness_contract_address,
-                    (callback_fee_limit + callback_fee_limit / 5).into(),
-                );
+                .transferFrom(get_caller_address(), get_contract_address(), total_fee.into());
+            // then approve the randomness contract to spend the callback fee
+            eth_dispatcher.approve(randomness_contract_address, total_fee.into());
 
             let seed: u64 = get_block_timestamp();
             randomness_dispatcher
