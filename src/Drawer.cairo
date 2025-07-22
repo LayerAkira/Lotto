@@ -14,28 +14,9 @@ pub struct DoubleOrNothingConfig {
 }
 
 #[starknet::interface]
-pub trait IPragmaVRF<TContractState> {
-    fn get_spin_random_word(self: @TContractState, user: ContractAddress) -> felt252;
-    fn get_draw_random_word(self: @TContractState) -> felt252;
-    fn request_randomness_from_pragma(
-        ref self: TContractState,
-        callback_address: ContractAddress,
-        callback_fee_limit: u128,
-        publish_delay: u64,
-        num_words: u64,
-        calldata: Array<felt252>,
-    );
-    fn receive_random_words(
-        ref self: TContractState,
-        requester_address: ContractAddress,
-        request_id: u64,
-        random_words: Span<felt252>,
-        calldata: Array<felt252>,
-    );
-    fn withdraw_extra_fee_fund(ref self: TContractState, receiver: ContractAddress);
+pub trait ICartridgeVRF<TContractState> {
     fn set_vrf_provider(ref self: TContractState, new_vrf_provider: ContractAddress);
-    fn clear_draw_random_number(ref self: TContractState);
-    fn clear_spin_random_number(ref self: TContractState, user: ContractAddress);
+    fn get_vrf_provider(self: @TContractState) -> ContractAddress;
 }
 
 #[starknet::interface]
@@ -62,36 +43,39 @@ pub trait IAkiLottoDrawer<TContractState> {
     fn double_spin(ref self: TContractState) -> bool;
 }
 
+#[starknet::interface]
+pub trait IUpgradeable<TContractState> {
+    fn upgrade(ref self: TContractState, new_class_hash: starknet::ClassHash);
+    fn get_implementation(self: @TContractState) -> starknet::ClassHash;
+    fn get_version(self: @TContractState) -> u32;
+}
+
 #[starknet::contract]
 mod AkiLottoDrawer {
+    use cartridge_vrf::{IVrfProviderDispatcher, IVrfProviderDispatcherTrait, Source};
     use core::traits::{Into, TryInto};
-    use openzeppelin_token::erc20::interface::{ERC20ABIDispatcher, ERC20ABIDispatcherTrait};
-    use pragma_lib::abi::{IRandomnessDispatcher, IRandomnessDispatcherTrait};
     use starknet::storage::{
         Map, MutableVecTrait, StoragePathEntry, StoragePointerReadAccess, StoragePointerWriteAccess,
         Vec,
     };
+    use starknet::syscalls::replace_class_syscall;
     use starknet::{
-        ContractAddress, get_block_number, get_block_timestamp, get_caller_address,
-        get_contract_address,
+        ClassHash, ContractAddress, get_block_timestamp, get_caller_address,
     };
-    use super::{DoubleOrNothingConfig, IAkiLottoDrawer, UserInfo};
+    use super::{DoubleOrNothingConfig, IAkiLottoDrawer, IUpgradeable, UserInfo};
 
     #[storage]
     struct Storage {
         user_info: Map<ContractAddress, UserInfo>,
         user_list: Vec<ContractAddress>, // to be used for iterating over users
-        user_spin_random: Map<
-            ContractAddress, felt252,
-        >, // to store user random numbers for double or nothing
         total_tickets: u256,
         owner: ContractAddress,
         has_drawed: bool, // indicates if the draw has been done
         double_or_nothing_cfg: DoubleOrNothingConfig,
         min_block_number_storage: u64,
-        draw_random_word: felt252,
-        pragma_vrf_contract_address: ContractAddress,
-        eth_address: ContractAddress,
+        vrf_contract_address: ContractAddress,
+        implementation_hash: ClassHash,
+        contract_version: u32,
     }
 
     #[event]
@@ -100,13 +84,14 @@ mod AkiLottoDrawer {
         DoubleOrNothingEvent: DoubleOrNothingEvent,
         DrawEvent: DrawEvent,
         UserConnectEvent: UserConnectEvent,
-        ReceiveRandomEvent: ReceiveRandomEvent,
+        UpgradeEvent: UpgradeEvent,
     }
 
     #[derive(Drop, starknet::Event)]
-    pub struct ReceiveRandomEvent {
-        pub random_word: felt252,
-        pub calldata: Array<felt252>,
+    pub struct UpgradeEvent {
+        pub old_class_hash: ClassHash,
+        pub new_class_hash: ClassHash,
+        pub version: u32,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -133,23 +118,23 @@ mod AkiLottoDrawer {
     fn constructor(
         ref self: ContractState,
         owner: ContractAddress,
-        pragma_vrf_contract_address: ContractAddress,
-        eth_address: ContractAddress,
+        vrf_contract_address: ContractAddress,
+        impl_hash: ClassHash,
     ) {
         self.owner.write(owner);
-        self.pragma_vrf_contract_address.write(pragma_vrf_contract_address);
-        self.eth_address.write(eth_address);
+        self.vrf_contract_address.write(vrf_contract_address);
+
+        self.implementation_hash.write(impl_hash);
+        self.contract_version.write(1_u32);
     }
 
-    #[external(v0)]
-    fn set_eth_address(ref self: ContractState, eth_address: ContractAddress) {
-        assert!(get_caller_address() == self.owner.read(), "Only owner can set the ETH address");
-        self.eth_address.write(eth_address);
+    fn _only_owner(self: @ContractState) {
+        assert!(get_caller_address() == self.owner.read(), "Only owner can perform this action");
     }
 
     #[external(v0)]
     fn set_owner(ref self: ContractState, owner: ContractAddress) {
-        assert!(get_caller_address() == self.owner.read(), "Only owner can set the owner");
+        _only_owner(@self);
         self.owner.write(owner);
     }
 
@@ -169,6 +154,31 @@ mod AkiLottoDrawer {
         }
         if !found {
             self.user_list.push(user);
+        }
+    }
+
+    #[abi(embed_v0)]
+    impl UpgradeableImpl of IUpgradeable<ContractState> {
+        fn upgrade(ref self: ContractState, new_class_hash: ClassHash) {
+            _only_owner(@self);
+
+            let old_class_hash = self.implementation_hash.read();
+
+            replace_class_syscall(new_class_hash).unwrap();
+
+            self.implementation_hash.write(new_class_hash);
+            let new_version = self.contract_version.read() + 1;
+            self.contract_version.write(new_version);
+
+            self.emit(UpgradeEvent { old_class_hash, new_class_hash, version: new_version });
+        }
+
+        fn get_implementation(self: @ContractState) -> ClassHash {
+            self.implementation_hash.read()
+        }
+
+        fn get_version(self: @ContractState) -> u32 {
+            self.contract_version.read()
         }
     }
 
@@ -201,7 +211,7 @@ mod AkiLottoDrawer {
         }
 
         fn set_double_or_nothing_interval(ref self: ContractState, start: u64, end: u64) {
-            assert!(get_caller_address() == self.owner.read(), "Only owner can set the interval");
+            _only_owner(@self);
             assert!(start < end, "Start time must be less than end time");
 
             self.double_or_nothing_cfg.write(DoubleOrNothingConfig { start: start, end: end });
@@ -218,7 +228,7 @@ mod AkiLottoDrawer {
         }
 
         fn add_tickets(ref self: ContractState, user: ContractAddress, tickets: u256) {
-            assert!(get_caller_address() == self.owner.read(), "Only owner can add tickets");
+            _only_owner(@self);
             assert!(tickets > 0, "Tickets to add must be greater than zero");
             _check_and_push_user(ref self, user);
 
@@ -230,7 +240,7 @@ mod AkiLottoDrawer {
         }
 
         fn remove_tickets(ref self: ContractState, user: ContractAddress, tickets: u256) {
-            assert!(get_caller_address() == self.owner.read(), "Only owner can remove tickets");
+            _only_owner(@self);
             assert!(tickets > 0, "Tickets to remove must be greater than zero");
 
             let mut user_info = self.user_info.entry(user).read();
@@ -247,9 +257,8 @@ mod AkiLottoDrawer {
 
         fn draw(ref self: ContractState) -> (ContractAddress, u256) {
             assert!(!self.has_drawed.read(), "Draw has already been done");
-            assert!(get_caller_address() == self.owner.read(), "Only owner can draw");
+            _only_owner(@self);
             assert!(self.total_tickets.read() > 0, "No tickets to draw");
-            assert!(self.draw_random_word.read() != 0, "No Random Number Yet");
             assert!(self.user_list.len() > 0, "No users to draw from");
 
             _draw_winner(ref self)
@@ -265,10 +274,6 @@ mod AkiLottoDrawer {
             );
             assert!(!caller_info.has_spinned, "Already Spinned for Double or Nothing");
             assert!(caller_info.tickets > 0, "No tickets");
-            assert!(
-                self.user_spin_random.entry(caller).read() != 0,
-                "No Random Number Yet for double spin",
-            );
             assert!(!self.has_drawed.read(), "Draw has already been done");
 
             _double_spin(ref self)
@@ -278,7 +283,10 @@ mod AkiLottoDrawer {
     fn _double_spin(ref self: ContractState) -> bool {
         let caller = get_caller_address();
         let mut caller_info = self.user_info.entry(caller).read();
-        let random: u256 = self.user_spin_random.entry(caller).read().into();
+
+        // consume random number from VRF provider, note: request random must be called along with double spin
+        let vrf_provider = IVrfProviderDispatcher { contract_address: self.vrf_contract_address.read() };
+        let random: u256 = vrf_provider.consume_random(Source::Nonce(caller)).into();
 
         // head/tail logic: even → double, odd → nothing
         let win = (random.low & 1) == 0;
@@ -295,7 +303,6 @@ mod AkiLottoDrawer {
         self.user_info.entry(caller).write(caller_info);
 
         self.emit(DoubleOrNothingEvent { user: caller, tickets: caller_info.tickets, won: win });
-        self.user_spin_random.entry(caller).write(0);
         win
     }
 
@@ -314,7 +321,8 @@ mod AkiLottoDrawer {
         assert!(total_tickets > 0_u256, "No connected users with tickets");
         assert!(connected_user.len() > 0, "No connected users to draw from");
 
-        let random: u256 = self.draw_random_word.read().into();
+        let vrf_provider = IVrfProviderDispatcher { contract_address: self.vrf_contract_address.read() };
+        let random: u256 = vrf_provider.consume_random(Source::Nonce(get_caller_address())).into();
         let r: u256 = (random % total_tickets).try_into().unwrap();
 
         let mut cumulative = 0_u256;
@@ -335,7 +343,6 @@ mod AkiLottoDrawer {
         }
 
         let (winner_addr, tickets) = res;
-        self.draw_random_word.write(0);
         assert!(winner_addr != self.owner.read() && tickets != 0_u256, "No winner found");
         self.has_drawed.write(true);
 
@@ -343,130 +350,14 @@ mod AkiLottoDrawer {
     }
 
     #[abi(embed_v0)]
-    impl PragmaVRFOracle of super::IPragmaVRF<ContractState> {
-        fn get_draw_random_word(self: @ContractState) -> felt252 {
-            let last_random = self.draw_random_word.read();
-            last_random
-        }
-
-        fn get_spin_random_word(self: @ContractState, user: ContractAddress) -> felt252 {
-            self.user_spin_random.entry(user).read()
-        }
-
-        fn request_randomness_from_pragma(
-            ref self: ContractState,
-            callback_address: ContractAddress,
-            callback_fee_limit: u128,
-            publish_delay: u64,
-            num_words: u64,
-            calldata: Array<felt252>,
-        ) {
-            assert!(!self.has_drawed.read(), "Draw has already been done");
-            assert!(callback_fee_limit > 0, "Callback fee limit must be greater than zero");
-            assert!(publish_delay > 0, "Publish delay must be greater than zero");
-            assert!(num_words > 0, "Number of words must be greater than zero");
-            assert!(
-                callback_address == get_contract_address(),
-                "Callback address should be this contract address",
-            );
-
-            assert!(
-                !self.user_info.entry(get_caller_address()).read().has_spinned,
-                "User has already spun for double or nothing",
-            );
-            if let Some(x) = calldata.get(0) {
-                let user: felt252 = *x.unbox();
-                assert!(
-                    user.try_into().unwrap() == get_caller_address(),
-                    "User address in calldata does not match caller address",
-                );
-            } else {
-                assert!(
-                    get_caller_address() == self.owner.read(),
-                    "Only owner can request randomness without user address",
-                );
-            }
-
-            let randomness_contract_address = self.pragma_vrf_contract_address.read();
-            let randomness_dispatcher = IRandomnessDispatcher {
-                contract_address: randomness_contract_address,
-            };
-
-            let eth_dispatcher = ERC20ABIDispatcher { contract_address: self.eth_address.read() };
-            let total_fee = callback_fee_limit + callback_fee_limit / 5;
-            // first transfer the callback fee from caller to this contract
-            eth_dispatcher
-                .transferFrom(get_caller_address(), get_contract_address(), total_fee.into());
-            // then approve the randomness contract to spend the callback fee
-            eth_dispatcher.approve(randomness_contract_address, total_fee.into());
-
-            let seed: u64 = get_block_timestamp();
-            randomness_dispatcher
-                .request_random(
-                    seed, callback_address, callback_fee_limit, publish_delay, num_words, calldata,
-                );
-
-            let current_block_number = get_block_number();
-            self.min_block_number_storage.write(current_block_number + publish_delay);
-        }
-
-        fn receive_random_words(
-            ref self: ContractState,
-            requester_address: ContractAddress,
-            request_id: u64,
-            random_words: Span<felt252>,
-            calldata: Array<felt252>,
-        ) {
-            let caller_address = get_caller_address();
-            assert!(
-                caller_address == self.pragma_vrf_contract_address.read(),
-                "caller not randomness contract",
-            );
-            assert!(requester_address == get_contract_address(), "requester address mismatch");
-
-            let current_block_number = get_block_number();
-            let min_block_number = self.min_block_number_storage.read();
-            assert!(min_block_number <= current_block_number, "block number issue");
-
-            let random_word = *random_words.at(0);
-            match calldata.get(0) {
-                Some(x) => {
-                    let user: felt252 = *x.unbox();
-                    self.user_spin_random.entry(user.try_into().unwrap()).write(random_word);
-                },
-                None => { self.draw_random_word.write(random_word); },
-            }
-
-            self.emit(ReceiveRandomEvent { random_word: random_word, calldata: calldata });
-        }
-
-        fn withdraw_extra_fee_fund(ref self: ContractState, receiver: ContractAddress) {
-            assert!(
-                get_caller_address() == self.owner.read(), "Only owner can withdraw extra fee fund",
-            );
-
-            let eth_dispatcher = ERC20ABIDispatcher { contract_address: self.eth_address.read() };
-            let balance = eth_dispatcher.balance_of(get_contract_address());
-            eth_dispatcher.transfer(receiver, balance);
-        }
-
+    impl CartridgeVRFOracle of super::ICartridgeVRF<ContractState> {
         fn set_vrf_provider(ref self: ContractState, new_vrf_provider: ContractAddress) {
-            assert!(get_caller_address() == self.owner.read(), "Only owner can set VRF provider");
-            self.pragma_vrf_contract_address.write(new_vrf_provider);
+            _only_owner(@self);
+            self.vrf_contract_address.write(new_vrf_provider);
         }
 
-        fn clear_draw_random_number(ref self: ContractState) {
-            assert!(
-                get_caller_address() == self.owner.read(), "Only owner can clear random number",
-            );
-            self.draw_random_word.write(0);
-        }
-
-        fn clear_spin_random_number(ref self: ContractState, user: ContractAddress) {
-            assert!(
-                get_caller_address() == self.owner.read(), "Only owner can clear random number",
-            );
-            self.user_spin_random.entry(user).write(0);
+        fn get_vrf_provider(self: @ContractState) -> ContractAddress {
+            self.vrf_contract_address.read()
         }
     }
 }

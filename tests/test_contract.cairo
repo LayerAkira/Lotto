@@ -1,6 +1,6 @@
 use lotto::Drawer::{
-    IAkiLottoDrawerDispatcher, IAkiLottoDrawerDispatcherTrait, IPragmaVRFDispatcher,
-    IPragmaVRFDispatcherTrait,
+    IAkiLottoDrawerDispatcher, IAkiLottoDrawerDispatcherTrait, ICartridgeVRFDispatcher,
+    ICartridgeVRFDispatcherTrait,
 };
 use snforge_std::{
     ContractClassTrait, DeclareResultTrait, declare, start_cheat_caller_address_global,
@@ -8,7 +8,7 @@ use snforge_std::{
 };
 use starknet::{ContractAddress, contract_address_const, get_block_timestamp};
 
-fn deploy_drawer() -> (ContractAddress, IAkiLottoDrawerDispatcher, IPragmaVRFDispatcher) {
+fn deploy_drawer() -> (ContractAddress, IAkiLottoDrawerDispatcher, ICartridgeVRFDispatcher) {
     let vrf: ContractAddress = contract_address_const::<'VRFContract'>();
     let owner: ContractAddress = contract_address_const::<'owner'>();
     let contract_class = declare("AkiLottoDrawer").unwrap().contract_class();
@@ -20,7 +20,7 @@ fn deploy_drawer() -> (ContractAddress, IAkiLottoDrawerDispatcher, IPragmaVRFDis
     let (address, _receipt) = contract_class.deploy(@constructor).unwrap();
 
     let dispatcher = IAkiLottoDrawerDispatcher { contract_address: address };
-    let vrf_dispatcher = IPragmaVRFDispatcher { contract_address: vrf };
+    let vrf_dispatcher = ICartridgeVRFDispatcher { contract_address: vrf };
     (owner, dispatcher, vrf_dispatcher)
 }
 
