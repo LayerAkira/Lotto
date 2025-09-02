@@ -1,55 +1,3 @@
-use starknet::ContractAddress;
-
-#[derive(Copy, Drop, Serde, starknet::Store, PartialEq)]
-pub struct UserInfo {
-    pub tickets: u256, // number of tickets the user has
-    pub is_connected: bool, // indicates if the user has connected their wallet
-    pub has_spinned: bool // indicates if the user has already spun for double or nothing
-}
-
-#[derive(Copy, Drop, Serde, starknet::Store, PartialEq)]
-pub struct DoubleOrNothingConfig {
-    pub start: u64, // UTC in seconds when the double or nothing starts, 0 means disabled
-    pub end: u64 // UTC in seconds when the double or nothing ends, 0 means disabled
-}
-
-#[starknet::interface]
-pub trait ICartridgeVRF<TContractState> {
-    fn set_vrf_provider(ref self: TContractState, new_vrf_provider: ContractAddress);
-    fn get_vrf_provider(self: @TContractState) -> ContractAddress;
-}
-
-#[starknet::interface]
-pub trait IAkiLottoDrawer<TContractState> {
-    fn add_wallet(ref self: TContractState) -> bool;
-    fn get_user_info(self: @TContractState, user: ContractAddress) -> UserInfo;
-
-    fn add_tickets(ref self: TContractState, user: ContractAddress, tickets: u256);
-    // func to be called by the owner to remove tickets from a user
-    fn remove_tickets(ref self: TContractState, user: ContractAddress, tickets: u256);
-    fn get_total_tickets(self: @TContractState) -> u256;
-
-    // func to be called by the owner to get the contract address and draw the winner,
-    // returns the winner address and the number of tickets and emits a DrawEvent
-    fn draw(ref self: TContractState) -> (ContractAddress, u256);
-
-    // func to be called by the owner to set double or nothing interval
-    fn set_double_or_nothing_interval(ref self: TContractState, start: u64, end: u64);
-    fn is_double_active(self: @TContractState) -> bool;
-    fn get_double_interval(self: @TContractState) -> DoubleOrNothingConfig;
-
-    // func for double or nothing, called by the user to double the tickets of a them if they are
-    // connected a boolean indicating if the user won
-    fn double_spin(ref self: TContractState) -> bool;
-}
-
-#[starknet::interface]
-pub trait IUpgradeable<TContractState> {
-    fn upgrade(ref self: TContractState, new_class_hash: starknet::ClassHash);
-    fn get_implementation(self: @TContractState) -> starknet::ClassHash;
-    fn get_version(self: @TContractState) -> u32;
-}
-
 #[starknet::contract]
 mod AkiLottoDrawer {
     use cartridge_vrf::{IVrfProviderDispatcher, IVrfProviderDispatcherTrait, Source};
@@ -59,10 +7,10 @@ mod AkiLottoDrawer {
         Vec,
     };
     use starknet::syscalls::replace_class_syscall;
-    use starknet::{
-        ClassHash, ContractAddress, get_block_timestamp, get_caller_address,
-    };
-    use super::{DoubleOrNothingConfig, IAkiLottoDrawer, IUpgradeable, UserInfo};
+    use starknet::{ClassHash, ContractAddress, get_block_timestamp, get_caller_address};
+    use lotto::interface::{IAkiLottoDrawer, IUpgradeable, ICartridgeVRF};
+    use lotto::types::{UserInfo, UserTickets, DoubleOrNothingConfig};
+    use lotto::events::{DoubleOrNothingEvent, DrawEvent, UserConnectEvent, UpgradeEvent};
 
     #[storage]
     struct Storage {
@@ -85,33 +33,6 @@ mod AkiLottoDrawer {
         DrawEvent: DrawEvent,
         UserConnectEvent: UserConnectEvent,
         UpgradeEvent: UpgradeEvent,
-    }
-
-    #[derive(Drop, starknet::Event)]
-    pub struct UpgradeEvent {
-        pub old_class_hash: ClassHash,
-        pub new_class_hash: ClassHash,
-        pub version: u32,
-    }
-
-    #[derive(Drop, starknet::Event)]
-    pub struct UserConnectEvent {
-        pub user: ContractAddress,
-        pub tickets: u256,
-        pub has_spinned: bool,
-    }
-
-    #[derive(Drop, starknet::Event)]
-    pub struct DoubleOrNothingEvent {
-        pub user: ContractAddress,
-        pub tickets: u256,
-        pub won: bool,
-    }
-
-    #[derive(Drop, starknet::Event)]
-    pub struct DrawEvent {
-        pub winner: ContractAddress,
-        pub tickets: u256,
     }
 
     #[constructor]
@@ -251,6 +172,66 @@ mod AkiLottoDrawer {
             self.total_tickets.write(self.total_tickets.read() - tickets);
         }
 
+        fn add_tickets_batch(ref self: ContractState, user_tickets: Array<UserTickets>) {
+            _only_owner(@self);
+            assert!(user_tickets.len() > 0, "Batch cannot be empty");
+
+            let mut total_tickets_to_add = 0_u256;
+            let mut i = 0_u32;
+            let len = user_tickets.len();
+
+            while i < len {
+                let user_ticket = *user_tickets.at(i);
+                assert!(user_ticket.tickets > 0, "Tickets to add must be greater than zero");
+                total_tickets_to_add += user_ticket.tickets;
+                i += 1;
+            }
+
+            i = 0_u32;
+            while i < len {
+                let user_ticket = *user_tickets.at(i);
+                _check_and_push_user(ref self, user_ticket.user);
+
+                let mut user_info = self.user_info.entry(user_ticket.user).read();
+                user_info.tickets += user_ticket.tickets;
+                self.user_info.entry(user_ticket.user).write(user_info);
+                i += 1;
+            }
+
+            self.total_tickets.write(self.total_tickets.read() + total_tickets_to_add);
+        }
+
+        fn remove_tickets_batch(ref self: ContractState, user_tickets: Array<UserTickets>) {
+            _only_owner(@self);
+            assert!(user_tickets.len() > 0, "Batch cannot be empty");
+
+            let mut total_tickets_to_remove = 0_u256;
+            let mut i = 0_u32;
+            let len = user_tickets.len();
+
+            while i < len {
+                let user_ticket = *user_tickets.at(i);
+                assert!(user_ticket.tickets > 0, "Tickets to remove must be greater than zero");
+
+                let user_info = self.user_info.entry(user_ticket.user).read();
+                assert!(user_info.tickets >= user_ticket.tickets, "Not enough tickets to remove");
+
+                total_tickets_to_remove += user_ticket.tickets;
+                i += 1;
+            }
+
+            i = 0_u32;
+            while i < len {
+                let user_ticket = *user_tickets.at(i);
+                let mut user_info = self.user_info.entry(user_ticket.user).read();
+                user_info.tickets -= user_ticket.tickets;
+                self.user_info.entry(user_ticket.user).write(user_info);
+                i += 1;
+            }
+
+            self.total_tickets.write(self.total_tickets.read() - total_tickets_to_remove);
+        }
+
         fn get_total_tickets(self: @ContractState) -> u256 {
             self.total_tickets.read()
         }
@@ -284,8 +265,11 @@ mod AkiLottoDrawer {
         let caller = get_caller_address();
         let mut caller_info = self.user_info.entry(caller).read();
 
-        // consume random number from VRF provider, note: request random must be called along with double spin
-        let vrf_provider = IVrfProviderDispatcher { contract_address: self.vrf_contract_address.read() };
+        // consume random number from VRF provider, note: request random must be called along with
+        // double spin
+        let vrf_provider = IVrfProviderDispatcher {
+            contract_address: self.vrf_contract_address.read(),
+        };
         let random: u256 = vrf_provider.consume_random(Source::Nonce(caller)).into();
 
         // head/tail logic: even → double, odd → nothing
@@ -321,7 +305,9 @@ mod AkiLottoDrawer {
         assert!(total_tickets > 0_u256, "No connected users with tickets");
         assert!(connected_user.len() > 0, "No connected users to draw from");
 
-        let vrf_provider = IVrfProviderDispatcher { contract_address: self.vrf_contract_address.read() };
+        let vrf_provider = IVrfProviderDispatcher {
+            contract_address: self.vrf_contract_address.read(),
+        };
         let random: u256 = vrf_provider.consume_random(Source::Nonce(get_caller_address())).into();
         let r: u256 = (random % total_tickets).try_into().unwrap();
 
@@ -350,7 +336,7 @@ mod AkiLottoDrawer {
     }
 
     #[abi(embed_v0)]
-    impl CartridgeVRFOracle of super::ICartridgeVRF<ContractState> {
+    impl CartridgeVRFOracle of ICartridgeVRF<ContractState> {
         fn set_vrf_provider(ref self: ContractState, new_vrf_provider: ContractAddress) {
             _only_owner(@self);
             self.vrf_contract_address.write(new_vrf_provider);
