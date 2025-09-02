@@ -2,15 +2,17 @@
 mod AkiLottoDrawer {
     use cartridge_vrf::{IVrfProviderDispatcher, IVrfProviderDispatcherTrait, Source};
     use core::traits::{Into, TryInto};
+    use lotto::events::{
+        DoubleOrNothingEvent, DrawEvent, RandomnessCallerEvent, UpgradeEvent, UserConnectEvent,
+    };
+    use lotto::interface::{IAkiLottoDrawer, ICartridgeVRF, IUpgradeable};
+    use lotto::types::{DoubleOrNothingConfig, UserInfo, UserTickets};
     use starknet::storage::{
         Map, MutableVecTrait, StoragePathEntry, StoragePointerReadAccess, StoragePointerWriteAccess,
         Vec,
     };
     use starknet::syscalls::replace_class_syscall;
     use starknet::{ClassHash, ContractAddress, get_block_timestamp, get_caller_address};
-    use lotto::interface::{IAkiLottoDrawer, IUpgradeable, ICartridgeVRF};
-    use lotto::types::{UserInfo, UserTickets, DoubleOrNothingConfig};
-    use lotto::events::{DoubleOrNothingEvent, DrawEvent, UserConnectEvent, UpgradeEvent};
 
     #[storage]
     struct Storage {
@@ -24,6 +26,9 @@ mod AkiLottoDrawer {
         vrf_contract_address: ContractAddress,
         implementation_hash: ClassHash,
         contract_version: u32,
+        randomness_caller: Map<ContractAddress, ContractAddress>,
+        randomness_caller_rev: Map<ContractAddress, ContractAddress>,
+        draw_caller: ContractAddress,
     }
 
     #[event]
@@ -33,6 +38,7 @@ mod AkiLottoDrawer {
         DrawEvent: DrawEvent,
         UserConnectEvent: UserConnectEvent,
         UpgradeEvent: UpgradeEvent,
+        RandomnessCallerEvent: RandomnessCallerEvent,
     }
 
     #[constructor]
@@ -62,6 +68,17 @@ mod AkiLottoDrawer {
     #[external(v0)]
     fn get_owner(self: @ContractState) -> ContractAddress {
         self.owner.read()
+    }
+
+    #[external(v0)]
+    fn set_draw_caller(ref self: ContractState, caller: ContractAddress) {
+        _only_owner(@self);
+        self.draw_caller.write(caller);
+    }
+
+    #[external(v0)]
+    fn get_draw_caller(self: @ContractState) -> ContractAddress {
+        self.draw_caller.read()
     }
 
     fn _check_and_push_user(ref self: ContractState, user: ContractAddress) {
@@ -245,10 +262,9 @@ mod AkiLottoDrawer {
             _draw_winner(ref self)
         }
 
-        fn double_spin(ref self: ContractState) -> bool {
-            assert!(self.is_double_active(), "Double or Nothing is not active");
+        fn set_randomness_caller(ref self: ContractState, random_caller: ContractAddress) {
             let caller = get_caller_address();
-            let mut caller_info = self.user_info.entry(caller).read();
+            let caller_info = self.user_info.entry(caller).read();
 
             assert!(
                 caller_info.is_connected, "Wallet Connection Required for Double or Nothing Spin",
@@ -256,37 +272,70 @@ mod AkiLottoDrawer {
             assert!(!caller_info.has_spinned, "Already Spinned for Double or Nothing");
             assert!(caller_info.tickets > 0, "No tickets");
             assert!(!self.has_drawed.read(), "Draw has already been done");
+            assert!(!caller_info.has_spinned, "Already Spinned for Double or Nothing");
+
+            self.randomness_caller.entry(random_caller).write(caller);
+            self.randomness_caller_rev.entry(caller).write(random_caller);
+
+            self.emit(RandomnessCallerEvent { user: caller, caller: random_caller });
+        }
+
+        fn get_randomness_caller(self: @ContractState, user: ContractAddress) -> ContractAddress {
+            self.randomness_caller_rev.entry(user).read()
+        }
+
+        fn double_spin(ref self: ContractState) -> bool {
+            assert!(self.is_double_active(), "Double or Nothing is not active");
+            let random_caller = get_caller_address();
+            let user = self.randomness_caller.entry(random_caller).read();
+            let mut user_info = self.user_info.entry(user).read();
+
+            assert!(
+                user_info.is_connected, "Wallet Connection Required for Double or Nothing Spin",
+            );
+            assert!(!user_info.has_spinned, "Already Spinned for Double or Nothing");
+            assert!(user_info.tickets > 0, "No tickets");
+            assert!(!self.has_drawed.read(), "Draw has already been done");
 
             _double_spin(ref self)
         }
     }
 
     fn _double_spin(ref self: ContractState) -> bool {
-        let caller = get_caller_address();
-        let mut caller_info = self.user_info.entry(caller).read();
+        let random_caller = get_caller_address();
+        let user = self.randomness_caller.entry(random_caller).read();
+        let mut user_info = self.user_info.entry(user).read();
 
         // consume random number from VRF provider, note: request random must be called along with
         // double spin
         let vrf_provider = IVrfProviderDispatcher {
             contract_address: self.vrf_contract_address.read(),
         };
-        let random: u256 = vrf_provider.consume_random(Source::Nonce(caller)).into();
+        let random_word: felt252 = vrf_provider.consume_random(Source::Nonce(user));
+        let random: u256 = random_word.into();
 
         // head/tail logic: even → double, odd → nothing
         let win = (random.low & 1) == 0;
 
         let tickets = if win {
-            self.total_tickets.write(self.total_tickets.read() + caller_info.tickets);
-            caller_info.tickets * 2
+            self.total_tickets.write(self.total_tickets.read() + user_info.tickets);
+            user_info.tickets * 2
         } else {
-            self.total_tickets.write(self.total_tickets.read() - caller_info.tickets);
+            self.total_tickets.write(self.total_tickets.read() - user_info.tickets);
             0
         };
-        caller_info.has_spinned = true;
-        caller_info.tickets = tickets;
-        self.user_info.entry(caller).write(caller_info);
+        user_info.has_spinned = true;
+        user_info.tickets = tickets;
+        self.user_info.entry(user).write(user_info);
 
-        self.emit(DoubleOrNothingEvent { user: caller, tickets: caller_info.tickets, won: win });
+        self.emit(
+            DoubleOrNothingEvent {
+                user: user,
+                tickets: user_info.tickets,
+                won: win,
+                random_word: random_word
+            }
+        );
         win
     }
 

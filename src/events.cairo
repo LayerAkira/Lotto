@@ -19,10 +19,17 @@ pub struct DoubleOrNothingEvent {
     pub user: ContractAddress,
     pub tickets: u256,
     pub won: bool,
+    pub random_word: felt252
 }
 
 #[derive(Drop, starknet::Event)]
 pub struct DrawEvent {
     pub winner: ContractAddress,
     pub tickets: u256,
+}
+
+#[derive(Drop, starknet::Event)]
+pub struct RandomnessCallerEvent {
+    pub user: ContractAddress,
+    pub caller: ContractAddress,
 }

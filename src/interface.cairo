@@ -1,6 +1,5 @@
+use lotto::types::{DoubleOrNothingConfig, UserInfo, UserTickets};
 use starknet::ContractAddress;
-
-use lotto::types::{UserTickets, DoubleOrNothingConfig, UserInfo};
 
 #[starknet::interface]
 pub trait ICartridgeVRF<TContractState> {
@@ -34,6 +33,8 @@ pub trait IAkiLottoDrawer<TContractState> {
     // func for double or nothing, called by the user to double the tickets of a them if they are
     // connected a boolean indicating if the user won
     fn double_spin(ref self: TContractState) -> bool;
+    fn set_randomness_caller(ref self: TContractState, random_caller: ContractAddress);
+    fn get_randomness_caller(self: @TContractState, user: ContractAddress) -> ContractAddress;
 }
 
 #[starknet::interface]
