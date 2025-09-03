@@ -12,7 +12,9 @@ mod AkiLottoDrawer {
         Vec,
     };
     use starknet::syscalls::replace_class_syscall;
-    use starknet::{ClassHash, ContractAddress, get_block_timestamp, get_caller_address};
+    use starknet::{
+        ClassHash, ContractAddress, get_block_timestamp, get_caller_address,
+    };
 
     #[storage]
     struct Storage {
@@ -29,6 +31,8 @@ mod AkiLottoDrawer {
         randomness_caller: Map<ContractAddress, ContractAddress>,
         randomness_caller_rev: Map<ContractAddress, ContractAddress>,
         draw_caller: ContractAddress,
+        past_winners: Vec<ContractAddress>,
+        winner_set: Map<ContractAddress, bool>,
     }
 
     #[event]
@@ -81,6 +85,11 @@ mod AkiLottoDrawer {
         self.draw_caller.read()
     }
 
+    #[external(v0)]
+    fn has_won(self: @ContractState, user: ContractAddress) -> bool {
+        self.winner_set.entry(user).read()
+    }
+
     fn _check_and_push_user(ref self: ContractState, user: ContractAddress) {
         let len = self.user_list.len();
         let mut found = false;
@@ -107,6 +116,7 @@ mod AkiLottoDrawer {
             self.implementation_hash.write(new_class_hash);
             let new_version = self.contract_version.read() + 1;
             self.contract_version.write(new_version);
+            self.draw_caller.write(self.owner.read());
 
             self.emit(UpgradeEvent { old_class_hash, new_class_hash, version: new_version });
         }
@@ -254,8 +264,10 @@ mod AkiLottoDrawer {
         }
 
         fn draw(ref self: ContractState) -> (ContractAddress, u256) {
-            assert!(!self.has_drawed.read(), "Draw has already been done");
-            _only_owner(@self);
+            assert!(
+                get_caller_address() == self.draw_caller.read(),
+                "Only draw caller can perform this action",
+            );
             assert!(self.total_tickets.read() > 0, "No tickets to draw");
             assert!(self.user_list.len() > 0, "No users to draw from");
 
@@ -271,7 +283,6 @@ mod AkiLottoDrawer {
             );
             assert!(!caller_info.has_spinned, "Already Spinned for Double or Nothing");
             assert!(caller_info.tickets > 0, "No tickets");
-            assert!(!self.has_drawed.read(), "Draw has already been done");
             assert!(!caller_info.has_spinned, "Already Spinned for Double or Nothing");
 
             self.randomness_caller.entry(random_caller).write(caller);
@@ -295,7 +306,6 @@ mod AkiLottoDrawer {
             );
             assert!(!user_info.has_spinned, "Already Spinned for Double or Nothing");
             assert!(user_info.tickets > 0, "No tickets");
-            assert!(!self.has_drawed.read(), "Draw has already been done");
 
             _double_spin(ref self)
         }
@@ -328,60 +338,70 @@ mod AkiLottoDrawer {
         user_info.tickets = tickets;
         self.user_info.entry(user).write(user_info);
 
-        self.emit(
-            DoubleOrNothingEvent {
-                user: user,
-                tickets: user_info.tickets,
-                won: win,
-                random_word: random_word
-            }
-        );
+        self
+            .emit(
+                DoubleOrNothingEvent {
+                    user: user, tickets: user_info.tickets, won: win, random_word: random_word,
+                },
+            );
         win
     }
 
     fn _draw_winner(ref self: ContractState) -> (ContractAddress, u256) {
-        let mut connected_user = array![];
-        let mut total_tickets = 0_u256;
-        for i in 0_u64..self.user_list.len() {
+        let mut eligible = array![];
+        let mut sum = 0_u256;
+        let len_u = self.user_list.len();
+        for i in 0_u64..len_u {
             let addr: ContractAddress = self.user_list.at(i).read();
-            let user_info: UserInfo = self.user_info.entry(addr).read();
-            if user_info.is_connected {
-                connected_user.append(addr);
-                total_tickets += user_info.tickets;
+
+            if self.winner_set.entry(addr).read() {
+                continue;
+            }
+            let info: UserInfo = self.user_info.entry(addr).read();
+            if info.is_connected && info.tickets > 0 {
+                eligible.append(addr);
+                sum += info.tickets;
             }
         }
 
-        assert!(total_tickets > 0_u256, "No connected users with tickets");
-        assert!(connected_user.len() > 0, "No connected users to draw from");
+        assert!(sum > 0_u256, "No eligible tickets to draw");
 
         let vrf_provider = IVrfProviderDispatcher {
             contract_address: self.vrf_contract_address.read(),
         };
-        let random: u256 = vrf_provider.consume_random(Source::Nonce(get_caller_address())).into();
-        let r: u256 = (random % total_tickets).try_into().unwrap();
+        let random: u256 = vrf_provider.consume_random(Source::Nonce(self.owner.read())).into();
+        let r: u256 = (random % sum).try_into().unwrap();
 
         let mut cumulative = 0_u256;
-        let len = connected_user.len();
-        let mut i = 0_u32;
-
-        let mut res: (ContractAddress, u256) = (self.owner.read(), 0_u256);
-        while i != len {
-            let addr: ContractAddress = *connected_user.at(i);
-            let user_info: UserInfo = self.user_info.entry(addr).read();
-            cumulative += user_info.tickets;
+        let len_e = eligible.len();
+        let mut i_e = 0_u32;
+        let mut chosen: (ContractAddress, u256) = (self.owner.read(), 0_u256);
+        while i_e != len_e {
+            let addr: ContractAddress = *eligible.at(i_e);
+            let info: UserInfo = self.user_info.entry(addr).read();
+            cumulative += info.tickets;
             if cumulative > r {
-                self.emit(DrawEvent { winner: addr, tickets: user_info.tickets });
-                res = (addr, user_info.tickets);
+                chosen = (addr, info.tickets);
                 break;
             }
-            i += 1;
+            i_e += 1;
         }
 
-        let (winner_addr, tickets) = res;
-        assert!(winner_addr != self.owner.read() && tickets != 0_u256, "No winner found");
-        self.has_drawed.write(true);
+        let (winner_addr, winner_tickets) = chosen;
+        assert!(winner_addr != self.owner.read() && winner_tickets != 0_u256, "No winner found");
 
-        res
+        let mut winner_info = self.user_info.entry(winner_addr).read();
+        winner_info.tickets = 0_u256;
+        self.user_info.entry(winner_addr).write(winner_info);
+
+        self.total_tickets.write(self.total_tickets.read() - winner_tickets);
+
+        self.winner_set.entry(winner_addr).write(true);
+        self.past_winners.push(winner_addr);
+
+        self.emit(DrawEvent { winner: winner_addr, tickets: winner_tickets });
+
+        (winner_addr, winner_tickets)
     }
 
     #[abi(embed_v0)]
