@@ -19,8 +19,6 @@ pub trait IAkiLottoDrawer<TContractState> {
     fn remove_tickets(ref self: TContractState, user: ContractAddress, tickets: u256);
     fn remove_tickets_batch(ref self: TContractState, user_tickets: Array<UserTickets>);
 
-    fn get_total_tickets(self: @TContractState) -> u256;
-
     // func to be called by the owner to get the contract address and draw the winner,
     // returns the winner address and the number of tickets and emits a DrawEvent
     fn draw(ref self: TContractState) -> (ContractAddress, u256);

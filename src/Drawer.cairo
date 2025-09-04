@@ -12,9 +12,7 @@ mod AkiLottoDrawer {
         Vec,
     };
     use starknet::syscalls::replace_class_syscall;
-    use starknet::{
-        ClassHash, ContractAddress, get_block_timestamp, get_caller_address,
-    };
+    use starknet::{ClassHash, ContractAddress, get_block_timestamp, get_caller_address};
 
     #[storage]
     struct Storage {
@@ -257,10 +255,6 @@ mod AkiLottoDrawer {
             }
 
             self.total_tickets.write(self.total_tickets.read() - total_tickets_to_remove);
-        }
-
-        fn get_total_tickets(self: @ContractState) -> u256 {
-            self.total_tickets.read()
         }
 
         fn draw(ref self: ContractState) -> (ContractAddress, u256) {
