@@ -3,7 +3,8 @@ mod AkiLottoDrawer {
     use cartridge_vrf::{IVrfProviderDispatcher, IVrfProviderDispatcherTrait, Source};
     use core::traits::{Into, TryInto};
     use lotto::events::{
-        DoubleOrNothingEvent, DrawEvent, RandomnessCallerEvent, UpgradeEvent, UserConnectEvent,
+        DoubleOrNothingEvent, DrawEvent, DrawCallerEvent, SpinCallerEvent, UpgradeEvent, UserConnectEvent,
+        SpinSignup,
     };
     use lotto::interface::{IAkiLottoDrawer, ICartridgeVRF, IUpgradeable};
     use lotto::types::{DoubleOrNothingConfig, UserInfo, UserTickets};
@@ -31,6 +32,8 @@ mod AkiLottoDrawer {
         draw_caller: ContractAddress,
         past_winners: Vec<ContractAddress>,
         winner_set: Map<ContractAddress, bool>,
+        spin_caller: ContractAddress,
+        spin_signups: Map<ContractAddress, bool>,
     }
 
     #[event]
@@ -40,7 +43,9 @@ mod AkiLottoDrawer {
         DrawEvent: DrawEvent,
         UserConnectEvent: UserConnectEvent,
         UpgradeEvent: UpgradeEvent,
-        RandomnessCallerEvent: RandomnessCallerEvent,
+        DrawCallerEvent: DrawCallerEvent,
+        SpinCallerEvent: SpinCallerEvent,
+        SpinSignup: SpinSignup,
     }
 
     #[constructor]
@@ -76,6 +81,7 @@ mod AkiLottoDrawer {
     fn set_draw_caller(ref self: ContractState, caller: ContractAddress) {
         _only_owner(@self);
         self.draw_caller.write(caller);
+        self.emit(DrawCallerEvent { caller });
     }
 
     #[external(v0)]
@@ -84,8 +90,43 @@ mod AkiLottoDrawer {
     }
 
     #[external(v0)]
+    fn set_spin_caller(ref self: ContractState, caller: ContractAddress) {
+        _only_owner(@self);
+        self.spin_caller.write(caller);
+        self.emit(SpinCallerEvent { caller });
+    }
+
+    #[external(v0)]
+    fn get_spin_caller(self: @ContractState) -> ContractAddress {
+        self.spin_caller.read()
+    }
+
+    #[external(v0)]
     fn has_won(self: @ContractState, user: ContractAddress) -> bool {
         self.winner_set.entry(user).read()
+    }
+
+    #[external(v0)]
+    fn sign_for_spin(ref self: ContractState, sign: bool) {
+        let caller = get_caller_address();
+
+        if sign {
+            let user_info = self.user_info.entry(caller).read();
+            assert!(user_info.is_connected, "Wallet must be connected to sign");
+            assert!(!user_info.has_spinned, "User already spinned");
+            assert!(user_info.tickets > 0, "User must have tickets to sign");
+
+            self.spin_signups.entry(caller).write(true);
+        } else {
+            self.spin_signups.entry(caller).write(false);
+        }
+
+        self.emit(SpinSignup { user: caller, sign });
+    }
+
+    #[external(v0)]
+    fn is_signed_up_for_spin(self: @ContractState, user: ContractAddress) -> bool {
+        self.spin_signups.entry(user).read()
     }
 
     fn _check_and_push_user(ref self: ContractState, user: ContractAddress) {
@@ -115,6 +156,7 @@ mod AkiLottoDrawer {
             let new_version = self.contract_version.read() + 1;
             self.contract_version.write(new_version);
             self.draw_caller.write(self.owner.read());
+            self.spin_caller.write(self.owner.read());
 
             self.emit(UpgradeEvent { old_class_hash, new_class_hash, version: new_version });
         }
@@ -268,46 +310,28 @@ mod AkiLottoDrawer {
             _draw_winner(ref self)
         }
 
-        fn set_randomness_caller(ref self: ContractState, random_caller: ContractAddress) {
-            let caller = get_caller_address();
-            let caller_info = self.user_info.entry(caller).read();
-
-            assert!(
-                caller_info.is_connected, "Wallet Connection Required for Double or Nothing Spin",
-            );
-            assert!(!caller_info.has_spinned, "Already Spinned for Double or Nothing");
-            assert!(caller_info.tickets > 0, "No tickets");
-            assert!(!caller_info.has_spinned, "Already Spinned for Double or Nothing");
-
-            self.randomness_caller.entry(random_caller).write(caller);
-            self.randomness_caller_rev.entry(caller).write(random_caller);
-
-            self.emit(RandomnessCallerEvent { user: caller, caller: random_caller });
-        }
-
-        fn get_randomness_caller(self: @ContractState, user: ContractAddress) -> ContractAddress {
-            self.randomness_caller_rev.entry(user).read()
-        }
-
-        fn double_spin(ref self: ContractState) -> bool {
+        fn double_spin(ref self: ContractState, user: ContractAddress) -> bool {
             assert!(self.is_double_active(), "Double or Nothing is not active");
             let random_caller = get_caller_address();
-            let user = self.randomness_caller.entry(random_caller).read();
+            assert!(
+                random_caller == self.spin_caller.read(), "Should be called by spin caller only!",
+            );
+            assert!(self.spin_signups.entry(user).read(), "User has not signed up for spin");
+
             let mut user_info = self.user_info.entry(user).read();
 
             assert!(
-                user_info.is_connected, "Wallet Connection Required for Double or Nothing Spin",
+                user_info.is_connected,
+                "User Wallet Connection Required for Double or Nothing Spin",
             );
-            assert!(!user_info.has_spinned, "Already Spinned for Double or Nothing");
-            assert!(user_info.tickets > 0, "No tickets");
+            assert!(!user_info.has_spinned, "User has Already Spinned for Double or Nothing");
+            assert!(user_info.tickets > 0, "User has no tickets");
 
-            _double_spin(ref self)
+            _double_spin(ref self, user)
         }
     }
 
-    fn _double_spin(ref self: ContractState) -> bool {
-        let random_caller = get_caller_address();
-        let user = self.randomness_caller.entry(random_caller).read();
+    fn _double_spin(ref self: ContractState, user: ContractAddress) -> bool {
         let mut user_info = self.user_info.entry(user).read();
 
         // consume random number from VRF provider, note: request random must be called along with
@@ -348,9 +372,6 @@ mod AkiLottoDrawer {
         for i in 0_u64..len_u {
             let addr: ContractAddress = self.user_list.at(i).read();
 
-            if self.winner_set.entry(addr).read() {
-                continue;
-            }
             let info: UserInfo = self.user_info.entry(addr).read();
             if info.is_connected && info.tickets > 0 {
                 eligible.append(addr);
@@ -383,12 +404,6 @@ mod AkiLottoDrawer {
 
         let (winner_addr, winner_tickets) = chosen;
         assert!(winner_addr != self.owner.read() && winner_tickets != 0_u256, "No winner found");
-
-        let mut winner_info = self.user_info.entry(winner_addr).read();
-        winner_info.tickets = 0_u256;
-        self.user_info.entry(winner_addr).write(winner_info);
-
-        self.total_tickets.write(self.total_tickets.read() - winner_tickets);
 
         self.winner_set.entry(winner_addr).write(true);
         self.past_winners.push(winner_addr);

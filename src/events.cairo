@@ -29,7 +29,17 @@ pub struct DrawEvent {
 }
 
 #[derive(Drop, starknet::Event)]
-pub struct RandomnessCallerEvent {
-    pub user: ContractAddress,
+pub struct SpinCallerEvent {
     pub caller: ContractAddress,
+}
+
+#[derive(Drop, starknet::Event)]
+pub struct DrawCallerEvent {
+    pub caller: ContractAddress,
+}
+
+#[derive(Drop, starknet::Event)]
+pub struct SpinSignup {
+    pub user: ContractAddress,
+    pub sign: bool
 }
