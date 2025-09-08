@@ -15,11 +15,11 @@ pub struct UserConnectEvent {
 }
 
 #[derive(Drop, starknet::Event)]
-pub struct DoubleOrNothingEvent {
+pub struct DoubleOrHalveEvent {
     pub user: ContractAddress,
     pub tickets: u256,
     pub won: bool,
-    pub random_word: felt252
+    pub random_word: felt252,
 }
 
 #[derive(Drop, starknet::Event)]
@@ -31,6 +31,7 @@ pub struct DrawEvent {
 #[derive(Drop, starknet::Event)]
 pub struct SpinCallerEvent {
     pub caller: ContractAddress,
+    pub user: ContractAddress,
 }
 
 #[derive(Drop, starknet::Event)]
@@ -41,5 +42,5 @@ pub struct DrawCallerEvent {
 #[derive(Drop, starknet::Event)]
 pub struct SpinSignup {
     pub user: ContractAddress,
-    pub sign: bool
+    pub sign: bool,
 }

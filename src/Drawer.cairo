@@ -3,8 +3,8 @@ mod AkiLottoDrawer {
     use cartridge_vrf::{IVrfProviderDispatcher, IVrfProviderDispatcherTrait, Source};
     use core::traits::{Into, TryInto};
     use lotto::events::{
-        DoubleOrNothingEvent, DrawEvent, DrawCallerEvent, SpinCallerEvent, UpgradeEvent, UserConnectEvent,
-        SpinSignup,
+        DoubleOrHalveEvent, DrawCallerEvent, DrawEvent, SpinCallerEvent, SpinSignup, UpgradeEvent,
+        UserConnectEvent,
     };
     use lotto::interface::{IAkiLottoDrawer, ICartridgeVRF, IUpgradeable};
     use lotto::types::{DoubleOrNothingConfig, UserInfo, UserTickets};
@@ -39,7 +39,7 @@ mod AkiLottoDrawer {
     #[event]
     #[derive(Drop, starknet::Event)]
     enum Event {
-        DoubleOrNothingEvent: DoubleOrNothingEvent,
+        DoubleOrHalveEvent: DoubleOrHalveEvent,
         DrawEvent: DrawEvent,
         UserConnectEvent: UserConnectEvent,
         UpgradeEvent: UpgradeEvent,
@@ -90,15 +90,22 @@ mod AkiLottoDrawer {
     }
 
     #[external(v0)]
-    fn set_spin_caller(ref self: ContractState, caller: ContractAddress) {
-        _only_owner(@self);
-        self.spin_caller.write(caller);
-        self.emit(SpinCallerEvent { caller });
+    fn set_spin_caller(ref self: ContractState, random_caller: ContractAddress) {
+        let caller = get_caller_address();
+        let caller_info = self.user_info.entry(caller).read();
+        assert!(caller_info.is_connected, "Wallet Connection Required for Double or Nothing Spin");
+        assert!(!caller_info.has_spinned, "Already Spinned for Double or Nothing");
+        assert!(caller_info.tickets > 0, "No tickets");
+
+        self.randomness_caller.entry(random_caller).write(caller);
+        self.randomness_caller_rev.entry(caller).write(random_caller);
+
+        self.emit(SpinCallerEvent { user: caller, caller: random_caller });
     }
 
     #[external(v0)]
-    fn get_spin_caller(self: @ContractState) -> ContractAddress {
-        self.spin_caller.read()
+    fn get_spin_caller(self: @ContractState, user: ContractAddress) -> ContractAddress {
+        self.randomness_caller_rev.entry(user).read()
     }
 
     #[external(v0)]
@@ -310,16 +317,13 @@ mod AkiLottoDrawer {
             _draw_winner(ref self)
         }
 
-        fn double_spin(ref self: ContractState, user: ContractAddress) -> bool {
+        fn double_spin(ref self: ContractState) -> bool {
             assert!(self.is_double_active(), "Double or Nothing is not active");
             let random_caller = get_caller_address();
-            assert!(
-                random_caller == self.spin_caller.read(), "Should be called by spin caller only!",
-            );
-            assert!(self.spin_signups.entry(user).read(), "User has not signed up for spin");
-
+            let user = self.randomness_caller.entry(random_caller).read();
             let mut user_info = self.user_info.entry(user).read();
 
+            assert!(self.spin_signups.entry(user).read(), "User has not signed up for spin");
             assert!(
                 user_info.is_connected,
                 "User Wallet Connection Required for Double or Nothing Spin",
@@ -342,15 +346,15 @@ mod AkiLottoDrawer {
         let random_word: felt252 = vrf_provider.consume_random(Source::Nonce(user));
         let random: u256 = random_word.into();
 
-        // head/tail logic: even → double, odd → nothing
+        // head/tail logic: even → double, odd → half
         let win = (random.low & 1) == 0;
 
         let tickets = if win {
             self.total_tickets.write(self.total_tickets.read() + user_info.tickets);
             user_info.tickets * 2
         } else {
-            self.total_tickets.write(self.total_tickets.read() - user_info.tickets);
-            0
+            self.total_tickets.write(self.total_tickets.read() - user_info.tickets / 2);
+            user_info.tickets / 2
         };
         user_info.has_spinned = true;
         user_info.tickets = tickets;
@@ -358,7 +362,7 @@ mod AkiLottoDrawer {
 
         self
             .emit(
-                DoubleOrNothingEvent {
+                DoubleOrHalveEvent {
                     user: user, tickets: user_info.tickets, won: win, random_word: random_word,
                 },
             );

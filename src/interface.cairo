@@ -30,7 +30,7 @@ pub trait IAkiLottoDrawer<TContractState> {
 
     // func for double or nothing, called by the user to double the tickets of a them if they are
     // connected a boolean indicating if the user won
-    fn double_spin(ref self: TContractState, user: ContractAddress) -> bool;
+    fn double_spin(ref self: TContractState) -> bool;
 }
 
 #[starknet::interface]
