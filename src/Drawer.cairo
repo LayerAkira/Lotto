@@ -136,6 +136,14 @@ mod AkiLottoDrawer {
         self.spin_signups.entry(user).read()
     }
 
+    #[external(v0)]
+    fn reset_user_spin(ref self: ContractState, user: ContractAddress) {
+        _only_owner(@self);
+        let mut info = self.user_info.entry(user).read();
+        info.has_spinned = false;
+        self.user_info.entry(user).write(info);
+    }
+
     fn _check_and_push_user(ref self: ContractState, user: ContractAddress) {
         let len = self.user_list.len();
         let mut found = false;
