@@ -13,7 +13,9 @@ mod AkiLottoDrawer {
         Vec,
     };
     use starknet::syscalls::replace_class_syscall;
-    use starknet::{ClassHash, ContractAddress, get_block_timestamp, get_caller_address};
+    use starknet::{
+        ClassHash, ContractAddress, get_block_timestamp, get_caller_address, get_contract_address,
+    };
 
     #[storage]
     struct Storage {
@@ -345,13 +347,14 @@ mod AkiLottoDrawer {
 
     fn _double_spin(ref self: ContractState, user: ContractAddress) -> bool {
         let mut user_info = self.user_info.entry(user).read();
+        let contract_addr = get_contract_address();
 
         // consume random number from VRF provider, note: request random must be called along with
         // double spin
         let vrf_provider = IVrfProviderDispatcher {
             contract_address: self.vrf_contract_address.read(),
         };
-        let random_word: felt252 = vrf_provider.consume_random(Source::Nonce(user));
+        let random_word: felt252 = vrf_provider.consume_random(Source::Nonce(contract_addr));
         let random: u256 = random_word.into();
 
         // head/tail logic: even → double, odd → half
@@ -393,10 +396,11 @@ mod AkiLottoDrawer {
 
         assert!(sum > 0_u256, "No eligible tickets to draw");
 
+        let contract_addr = get_contract_address();
         let vrf_provider = IVrfProviderDispatcher {
             contract_address: self.vrf_contract_address.read(),
         };
-        let random: u256 = vrf_provider.consume_random(Source::Nonce(self.owner.read())).into();
+        let random: u256 = vrf_provider.consume_random(Source::Nonce(contract_addr)).into();
         let r: u256 = (random % sum).try_into().unwrap();
 
         let mut cumulative = 0_u256;
