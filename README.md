@@ -76,4 +76,4 @@ Integrates with **Pragma VRF** for secure randomness and **ERC20** for fee handl
 - **Sepolia**:
   - Deployed @ [0x0033907d0cf21be5f0eabfb9e1c16369f60723bff403168a79cb96c684c2e4d1](https://sepolia.voyager.online/contract/0x0033907d0cf21be5f0eabfb9e1c16369f60723bff403168a79cb96c684c2e4d10x0033907d0cf21be5f0eabfb9e1c16369f60723bff403168a79cb96c684c2e4d1)
 - **Mainnet**:
-  - Deployed @ [0x0085e773fe407bfeab1484df7b62ecad1ba382dec0ec3a9b569be7178fd7231a](https://voyager.online/contract/0x0085e773fe407bfeab1484df7b62ecad1ba382dec0ec3a9b569be7178fd7231a)
+  - Deployed @ [0x00800ba849776dec2b96ff533312b097fcd4aa023285eaf534f4deeb595aa8a7](https://voyager.online/contract/0x05c9ff012bb5624615f81be84a6672d7843de9c9dbdc2e27728d3c98673da2ef)

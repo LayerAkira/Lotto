@@ -37,10 +37,19 @@ pub struct SpinCallerEvent {
 #[derive(Drop, starknet::Event)]
 pub struct DrawCallerEvent {
     pub caller: ContractAddress,
+    pub authorized: bool,
 }
 
 #[derive(Drop, starknet::Event)]
 pub struct SpinSignup {
     pub user: ContractAddress,
     pub sign: bool,
+}
+
+#[derive(Drop, starknet::Event)]
+pub struct PoolResetEvent {
+    pub reset_by: ContractAddress,
+    pub users_affected: u64,
+    pub tickets_cleared: u256,
+    pub timestamp: u64,
 }

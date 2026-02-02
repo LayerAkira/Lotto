@@ -3,75 +3,103 @@ mod AkiLottoDrawer {
     use cartridge_vrf::{IVrfProviderDispatcher, IVrfProviderDispatcherTrait, Source};
     use core::traits::{Into, TryInto};
     use lotto::events::{
-        DoubleOrHalveEvent, DrawCallerEvent, DrawEvent, SpinCallerEvent, SpinSignup, UpgradeEvent,
-        UserConnectEvent,
+        DoubleOrHalveEvent, DrawCallerEvent, DrawEvent, PoolResetEvent,
+        SpinCallerEvent, SpinSignup, UpgradeEvent, UserConnectEvent,
     };
     use lotto::interface::{IAkiLottoDrawer, ICartridgeVRF, IUpgradeable};
-    use lotto::types::{DoubleOrNothingConfig, UserInfo, UserTickets};
+    use lotto::types::{
+        DoubleOrNothingConfig, DrawCallerInfo, PoolStats, UserInfo, UserTickets,
+    };
     use starknet::storage::{
-        Map, MutableVecTrait, StoragePathEntry, StoragePointerReadAccess, StoragePointerWriteAccess,
-        Vec,
+        Map, MutableVecTrait, StoragePathEntry, StoragePointerReadAccess,
+        StoragePointerWriteAccess, Vec, VecTrait,
     };
     use starknet::syscalls::replace_class_syscall;
     use starknet::{
-        ClassHash, ContractAddress, get_block_timestamp, get_caller_address, get_contract_address,
+        ClassHash, ContractAddress, get_block_timestamp, get_caller_address,
+        get_contract_address,
     };
+
+
 
     #[storage]
     struct Storage {
-        user_info: Map<ContractAddress, UserInfo>,
-        user_list: Vec<ContractAddress>, // to be used for iterating over users
-        total_tickets: u256,
         owner: ContractAddress,
-        has_drawed: bool, // indicates if the draw has been done
-        double_or_nothing_cfg: DoubleOrNothingConfig,
-        min_block_number_storage: u64,
-        vrf_contract_address: ContractAddress,
-        implementation_hash: ClassHash,
-        contract_version: u32,
-        randomness_caller: Map<ContractAddress, ContractAddress>,
-        randomness_caller_rev: Map<ContractAddress, ContractAddress>,
-        draw_caller: ContractAddress,
-        past_winners: Vec<ContractAddress>,
+        total_tickets: u256,
+        total_draws: u64,
+
+        users: Map<ContractAddress, UserInfo>,
+        user_list: Vec<ContractAddress>,
+        user_exists: Map<ContractAddress, bool>,
+
+        winners: Vec<ContractAddress>,
         winner_set: Map<ContractAddress, bool>,
-        spin_caller: ContractAddress,
+
+        draw_callers: Map<ContractAddress, DrawCallerInfo>,
+
+        double_config: DoubleOrNothingConfig,
+        spin_callers: Map<ContractAddress, ContractAddress>,      // vrf_caller -> user
+        spin_callers_rev: Map<ContractAddress, ContractAddress>,  // user -> vrf_caller
         spin_signups: Map<ContractAddress, bool>,
+
+        vrf_provider: ContractAddress,
+        impl_hash: ClassHash,
+        version: u32,
     }
 
     #[event]
     #[derive(Drop, starknet::Event)]
     enum Event {
+        UpgradeEvent: UpgradeEvent,
+        UserConnectEvent: UserConnectEvent,
         DoubleOrHalveEvent: DoubleOrHalveEvent,
         DrawEvent: DrawEvent,
-        UserConnectEvent: UserConnectEvent,
-        UpgradeEvent: UpgradeEvent,
         DrawCallerEvent: DrawCallerEvent,
         SpinCallerEvent: SpinCallerEvent,
         SpinSignup: SpinSignup,
+        PoolResetEvent: PoolResetEvent,
     }
 
     #[constructor]
     fn constructor(
         ref self: ContractState,
         owner: ContractAddress,
-        vrf_contract_address: ContractAddress,
+        vrf_provider: ContractAddress,
         impl_hash: ClassHash,
     ) {
         self.owner.write(owner);
-        self.vrf_contract_address.write(vrf_contract_address);
+        self.vrf_provider.write(vrf_provider);
+        self.impl_hash.write(impl_hash);
+        self.version.write(1);
 
-        self.implementation_hash.write(impl_hash);
-        self.contract_version.write(1_u32);
+        // Owner is authorized to draw by default
+        self.draw_callers.entry(owner).write(DrawCallerInfo {
+            is_authorized: true,
+            draw_count: 0,
+            last_draw_timestamp: 0,
+        });
     }
 
-    fn _only_owner(self: @ContractState) {
-        assert!(get_caller_address() == self.owner.read(), "Only owner can perform this action");
+    /// Reverts if caller is not the owner
+    fn assert_owner(self: @ContractState) {
+        assert!(
+            get_caller_address() == self.owner.read(),
+            "Unauthorized: owner only"
+        );
     }
+
+    /// Reverts if caller is not an authorized draw caller
+    fn assert_draw_caller(self: @ContractState) {
+        let caller = get_caller_address();
+        let info = self.draw_callers.entry(caller).read();
+        assert!(info.is_authorized, "Unauthorized: draw caller only");
+    }
+
 
     #[external(v0)]
-    fn set_owner(ref self: ContractState, owner: ContractAddress) {
-        _only_owner(@self);
-        self.owner.write(owner);
+    fn set_owner(ref self: ContractState, new_owner: ContractAddress) {
+        assert_owner(@self);
+        self.owner.write(new_owner);
     }
 
     #[external(v0)]
@@ -80,57 +108,38 @@ mod AkiLottoDrawer {
     }
 
     #[external(v0)]
-    fn set_draw_caller(ref self: ContractState, caller: ContractAddress) {
-        _only_owner(@self);
-        self.draw_caller.write(caller);
-        self.emit(DrawCallerEvent { caller });
-    }
+    fn set_spin_caller(ref self: ContractState, vrf_caller: ContractAddress) {
+        let user = get_caller_address();
+        let info = self.users.entry(user).read();
 
-    #[external(v0)]
-    fn get_draw_caller(self: @ContractState) -> ContractAddress {
-        self.draw_caller.read()
-    }
+        assert!(info.is_connected, "Must connect wallet first");
+        assert!(!info.has_spinned, "Already spinned");
+        assert!(info.tickets > 0, "No tickets");
 
-    #[external(v0)]
-    fn set_spin_caller(ref self: ContractState, random_caller: ContractAddress) {
-        let caller = get_caller_address();
-        let caller_info = self.user_info.entry(caller).read();
-        assert!(caller_info.is_connected, "Wallet Connection Required for Double or Nothing Spin");
-        assert!(!caller_info.has_spinned, "Already Spinned for Double or Nothing");
-        assert!(caller_info.tickets > 0, "No tickets");
+        self.spin_callers.entry(vrf_caller).write(user);
+        self.spin_callers_rev.entry(user).write(vrf_caller);
 
-        self.randomness_caller.entry(random_caller).write(caller);
-        self.randomness_caller_rev.entry(caller).write(random_caller);
-
-        self.emit(SpinCallerEvent { user: caller, caller: random_caller });
+        self.emit(SpinCallerEvent { user, caller: vrf_caller });
     }
 
     #[external(v0)]
     fn get_spin_caller(self: @ContractState, user: ContractAddress) -> ContractAddress {
-        self.randomness_caller_rev.entry(user).read()
-    }
-
-    #[external(v0)]
-    fn has_won(self: @ContractState, user: ContractAddress) -> bool {
-        self.winner_set.entry(user).read()
+        self.spin_callers_rev.entry(user).read()
     }
 
     #[external(v0)]
     fn sign_for_spin(ref self: ContractState, sign: bool) {
-        let caller = get_caller_address();
+        let user = get_caller_address();
 
         if sign {
-            let user_info = self.user_info.entry(caller).read();
-            assert!(user_info.is_connected, "Wallet must be connected to sign");
-            assert!(!user_info.has_spinned, "User already spinned");
-            assert!(user_info.tickets > 0, "User must have tickets to sign");
-
-            self.spin_signups.entry(caller).write(true);
-        } else {
-            self.spin_signups.entry(caller).write(false);
+            let info = self.users.entry(user).read();
+            assert!(info.is_connected, "Must connect wallet first");
+            assert!(!info.has_spinned, "Already spinned");
+            assert!(info.tickets > 0, "No tickets");
         }
 
-        self.emit(SpinSignup { user: caller, sign });
+        self.spin_signups.entry(user).write(sign);
+        self.emit(SpinSignup { user, sign });
     }
 
     #[external(v0)]
@@ -140,304 +149,398 @@ mod AkiLottoDrawer {
 
     #[external(v0)]
     fn reset_user_spin(ref self: ContractState, user: ContractAddress) {
-        _only_owner(@self);
-        let mut info = self.user_info.entry(user).read();
+        assert_owner(@self);
+        let mut info = self.users.entry(user).read();
         info.has_spinned = false;
-        self.user_info.entry(user).write(info);
+        self.users.entry(user).write(info);
     }
 
-    fn _check_and_push_user(ref self: ContractState, user: ContractAddress) {
-        let len = self.user_list.len();
-        let mut found = false;
-        for i in 0_u64..len {
-            if self.user_list.at(i).read() == user {
-                found = true;
-                break;
-            }
-        }
-        if !found {
+    /// Ensures user is tracked in user_list (O(1) check)
+    fn ensure_user_tracked(ref self: ContractState, user: ContractAddress) {
+        if !self.user_exists.entry(user).read() {
             self.user_list.push(user);
+            self.user_exists.entry(user).write(true);
         }
+    }
+
+    /// Consume VRF randomness
+    fn consume_vrf(self: @ContractState) -> u256 {
+        let vrf = IVrfProviderDispatcher { contract_address: self.vrf_provider.read() };
+        let random_felt: felt252 = vrf.consume_random(Source::Nonce(get_contract_address()));
+        random_felt.into()
     }
 
     #[abi(embed_v0)]
     impl UpgradeableImpl of IUpgradeable<ContractState> {
         fn upgrade(ref self: ContractState, new_class_hash: ClassHash) {
-            _only_owner(@self);
+            assert_owner(@self);
 
-            let old_class_hash = self.implementation_hash.read();
-
+            let old_hash = self.impl_hash.read();
             replace_class_syscall(new_class_hash).unwrap();
 
-            self.implementation_hash.write(new_class_hash);
-            let new_version = self.contract_version.read() + 1;
-            self.contract_version.write(new_version);
-            self.draw_caller.write(self.owner.read());
-            self.spin_caller.write(self.owner.read());
+            self.impl_hash.write(new_class_hash);
+            let new_version = self.version.read() + 1;
+            self.version.write(new_version);
 
-            self.emit(UpgradeEvent { old_class_hash, new_class_hash, version: new_version });
+            self.emit(UpgradeEvent {
+                old_class_hash: old_hash,
+                new_class_hash,
+                version: new_version,
+            });
         }
 
         fn get_implementation(self: @ContractState) -> ClassHash {
-            self.implementation_hash.read()
+            self.impl_hash.read()
         }
 
         fn get_version(self: @ContractState) -> u32 {
-            self.contract_version.read()
+            self.version.read()
         }
     }
 
     #[abi(embed_v0)]
     impl AkiLottoDrawerImpl of IAkiLottoDrawer<ContractState> {
         fn add_wallet(ref self: ContractState) -> bool {
-            let caller = get_caller_address();
-            let user = self.user_info.entry(caller).read();
-            _check_and_push_user(ref self, caller);
+            let user = get_caller_address();
+            ensure_user_tracked(ref self, user);
 
-            let updated_user = UserInfo {
-                tickets: user.tickets, is_connected: true, has_spinned: false,
-            };
+            let mut info = self.users.entry(user).read();
+            info.is_connected = true;
+            self.users.entry(user).write(info);
 
-            self.user_info.entry(caller).write(updated_user);
+            self.emit(UserConnectEvent {
+                user,
+                tickets: info.tickets,
+                has_spinned: info.has_spinned,
+            });
 
-            self
-                .emit(
-                    UserConnectEvent {
-                        user: caller,
-                        tickets: updated_user.tickets,
-                        has_spinned: updated_user.has_spinned,
-                    },
-                );
             true
         }
 
         fn get_user_info(self: @ContractState, user: ContractAddress) -> UserInfo {
-            self.user_info.entry(user).read()
-        }
-
-        fn set_double_or_nothing_interval(ref self: ContractState, start: u64, end: u64) {
-            _only_owner(@self);
-            assert!(start < end, "Start time must be less than end time");
-
-            self.double_or_nothing_cfg.write(DoubleOrNothingConfig { start: start, end: end });
-        }
-
-        fn is_double_active(self: @ContractState) -> bool {
-            let now = get_block_timestamp();
-            let cfg = self.double_or_nothing_cfg.read();
-            cfg.start != 0 && now >= cfg.start && now <= cfg.end
-        }
-
-        fn get_double_interval(self: @ContractState) -> DoubleOrNothingConfig {
-            self.double_or_nothing_cfg.read()
+            self.users.entry(user).read()
         }
 
         fn add_tickets(ref self: ContractState, user: ContractAddress, tickets: u256) {
-            _only_owner(@self);
-            assert!(tickets > 0, "Tickets to add must be greater than zero");
-            _check_and_push_user(ref self, user);
+            assert_owner(@self);
+            assert!(tickets > 0, "Tickets must be > 0");
 
-            let mut user_info = self.user_info.entry(user).read();
+            ensure_user_tracked(ref self, user);
 
-            user_info.tickets += tickets;
-            self.user_info.entry(user).write(user_info);
+            let mut info = self.users.entry(user).read();
+            info.tickets += tickets;
+            self.users.entry(user).write(info);
+
             self.total_tickets.write(self.total_tickets.read() + tickets);
         }
 
         fn remove_tickets(ref self: ContractState, user: ContractAddress, tickets: u256) {
-            _only_owner(@self);
-            assert!(tickets > 0, "Tickets to remove must be greater than zero");
+            assert_owner(@self);
+            assert!(tickets > 0, "Tickets must be > 0");
 
-            let mut user_info = self.user_info.entry(user).read();
+            let mut info = self.users.entry(user).read();
+            assert!(info.tickets >= tickets, "Insufficient tickets");
 
-            assert!(user_info.tickets >= tickets, "Not enough tickets to remove");
-            user_info.tickets -= tickets;
-            self.user_info.entry(user).write(user_info);
+            info.tickets -= tickets;
+            self.users.entry(user).write(info);
+
             self.total_tickets.write(self.total_tickets.read() - tickets);
         }
 
         fn add_tickets_batch(ref self: ContractState, user_tickets: Array<UserTickets>) {
-            _only_owner(@self);
-            assert!(user_tickets.len() > 0, "Batch cannot be empty");
+            assert_owner(@self);
+            assert!(user_tickets.len() > 0, "Empty batch");
 
-            let mut total_tickets_to_add = 0_u256;
-            let mut i = 0_u32;
+            let mut total_added: u256 = 0;
             let len = user_tickets.len();
+            let mut i: u32 = 0;
 
+            // First pass: validate and sum
             while i < len {
-                let user_ticket = *user_tickets.at(i);
-                assert!(user_ticket.tickets > 0, "Tickets to add must be greater than zero");
-                total_tickets_to_add += user_ticket.tickets;
+                let ut = *user_tickets.at(i);
+                assert!(ut.tickets > 0, "Tickets must be > 0");
+                total_added += ut.tickets;
                 i += 1;
-            }
+            };
 
-            i = 0_u32;
+            // Second pass: apply changes
+            i = 0;
             while i < len {
-                let user_ticket = *user_tickets.at(i);
-                _check_and_push_user(ref self, user_ticket.user);
+                let ut = *user_tickets.at(i);
+                ensure_user_tracked(ref self, ut.user);
 
-                let mut user_info = self.user_info.entry(user_ticket.user).read();
-                user_info.tickets += user_ticket.tickets;
-                self.user_info.entry(user_ticket.user).write(user_info);
+                let mut info = self.users.entry(ut.user).read();
+                info.tickets += ut.tickets;
+                self.users.entry(ut.user).write(info);
                 i += 1;
-            }
+            };
 
-            self.total_tickets.write(self.total_tickets.read() + total_tickets_to_add);
+            self.total_tickets.write(self.total_tickets.read() + total_added);
         }
 
         fn remove_tickets_batch(ref self: ContractState, user_tickets: Array<UserTickets>) {
-            _only_owner(@self);
-            assert!(user_tickets.len() > 0, "Batch cannot be empty");
+            assert_owner(@self);
+            assert!(user_tickets.len() > 0, "Empty batch");
 
-            let mut total_tickets_to_remove = 0_u256;
-            let mut i = 0_u32;
+            let mut total_removed: u256 = 0;
             let len = user_tickets.len();
+            let mut i: u32 = 0;
 
+            // First pass: validate
             while i < len {
-                let user_ticket = *user_tickets.at(i);
-                assert!(user_ticket.tickets > 0, "Tickets to remove must be greater than zero");
+                let ut = *user_tickets.at(i);
+                assert!(ut.tickets > 0, "Tickets must be > 0");
 
-                let user_info = self.user_info.entry(user_ticket.user).read();
-                assert!(user_info.tickets >= user_ticket.tickets, "Not enough tickets to remove");
+                let info = self.users.entry(ut.user).read();
+                assert!(info.tickets >= ut.tickets, "Insufficient tickets");
 
-                total_tickets_to_remove += user_ticket.tickets;
+                total_removed += ut.tickets;
                 i += 1;
-            }
+            };
 
-            i = 0_u32;
+            // Second pass: apply
+            i = 0;
             while i < len {
-                let user_ticket = *user_tickets.at(i);
-                let mut user_info = self.user_info.entry(user_ticket.user).read();
-                user_info.tickets -= user_ticket.tickets;
-                self.user_info.entry(user_ticket.user).write(user_info);
+                let ut = *user_tickets.at(i);
+                let mut info = self.users.entry(ut.user).read();
+                info.tickets -= ut.tickets;
+                self.users.entry(ut.user).write(info);
                 i += 1;
-            }
+            };
 
-            self.total_tickets.write(self.total_tickets.read() - total_tickets_to_remove);
+            self.total_tickets.write(self.total_tickets.read() - total_removed);
         }
 
         fn draw(ref self: ContractState) -> (ContractAddress, u256) {
-            assert!(
-                get_caller_address() == self.draw_caller.read(),
-                "Only draw caller can perform this action",
-            );
-            assert!(self.total_tickets.read() > 0, "No tickets to draw");
-            assert!(self.user_list.len() > 0, "No users to draw from");
+            assert_draw_caller(@self);
+            assert!(self.total_tickets.read() > 0, "No tickets in pool");
+            assert!(self.user_list.len() > 0, "No users");
 
-            _draw_winner(ref self)
+            let caller = get_caller_address();
+
+            // Update caller stats
+            let mut caller_info = self.draw_callers.entry(caller).read();
+            caller_info.draw_count += 1;
+            caller_info.last_draw_timestamp = get_block_timestamp();
+            self.draw_callers.entry(caller).write(caller_info);
+
+            // Increment total draws
+            self.total_draws.write(self.total_draws.read() + 1);
+
+            // Execute weighted random selection
+            execute_draw(ref self)
+        }
+
+        fn has_won(self: @ContractState, user: ContractAddress) -> bool {
+            self.winner_set.entry(user).read()
+        }
+
+        fn set_double_or_nothing_interval(ref self: ContractState, start: u64, end: u64) {
+            assert_owner(@self);
+            assert!(start < end, "Invalid interval: start >= end");
+            self.double_config.write(DoubleOrNothingConfig { start, end });
+        }
+
+        fn is_double_active(self: @ContractState) -> bool {
+            let now = get_block_timestamp();
+            let cfg = self.double_config.read();
+            cfg.start != 0 && now >= cfg.start && now <= cfg.end
+        }
+
+        fn get_double_interval(self: @ContractState) -> DoubleOrNothingConfig {
+            self.double_config.read()
         }
 
         fn double_spin(ref self: ContractState) -> bool {
-            assert!(self.is_double_active(), "Double or Nothing is not active");
-            let random_caller = get_caller_address();
-            let user = self.randomness_caller.entry(random_caller).read();
-            let mut user_info = self.user_info.entry(user).read();
+            assert!(self.is_double_active(), "Double-or-nothing not active");
 
-            assert!(self.spin_signups.entry(user).read(), "User has not signed up for spin");
-            assert!(
-                user_info.is_connected,
-                "User Wallet Connection Required for Double or Nothing Spin",
-            );
-            assert!(!user_info.has_spinned, "User has Already Spinned for Double or Nothing");
-            assert!(user_info.tickets > 0, "User has no tickets");
+            let vrf_caller = get_caller_address();
+            let user = self.spin_callers.entry(vrf_caller).read();
 
-            _double_spin(ref self, user)
+            assert!(self.spin_signups.entry(user).read(), "Not signed up");
+
+            let mut info = self.users.entry(user).read();
+            assert!(info.is_connected, "Wallet not connected");
+            assert!(!info.has_spinned, "Already spinned");
+            assert!(info.tickets > 0, "No tickets");
+
+            execute_spin(ref self, user)
         }
-    }
 
-    fn _double_spin(ref self: ContractState, user: ContractAddress) -> bool {
-        let mut user_info = self.user_info.entry(user).read();
-        let contract_addr = get_contract_address();
+        fn reset_pool(ref self: ContractState) {
+            assert_owner(@self);
 
-        // consume random number from VRF provider, note: request random must be called along with
-        // double spin
-        let vrf_provider = IVrfProviderDispatcher {
-            contract_address: self.vrf_contract_address.read(),
-        };
-        let random_word: felt252 = vrf_provider.consume_random(Source::Nonce(contract_addr));
-        let random: u256 = random_word.into();
+            let total_before = self.total_tickets.read();
+            let user_count = self.user_list.len();
+            let mut affected: u64 = 0;
 
-        // head/tail logic: even → double, odd → half
-        let win = (random.low & 1) == 0;
+            // Reset all user tickets while preserving connection status
+            let mut i: u64 = 0;
+            while i < user_count {
+                let user = self.user_list.at(i).read();
+                let mut info = self.users.entry(user).read();
 
-        let tickets = if win {
-            self.total_tickets.write(self.total_tickets.read() + user_info.tickets);
-            user_info.tickets * 2
-        } else {
-            self.total_tickets.write(self.total_tickets.read() - user_info.tickets / 2);
-            user_info.tickets / 2
-        };
-        user_info.has_spinned = true;
-        user_info.tickets = tickets;
-        self.user_info.entry(user).write(user_info);
+                if info.tickets > 0 {
+                    info.tickets = 0;
+                    info.has_spinned = false;  // Reset spin status for new round
+                    self.users.entry(user).write(info);
+                    affected += 1;
+                }
+                i += 1;
+            };
 
-        self
-            .emit(
-                DoubleOrHalveEvent {
-                    user: user, tickets: user_info.tickets, won: win, random_word: random_word,
-                },
-            );
-        win
-    }
+            self.total_tickets.write(0);
 
-    fn _draw_winner(ref self: ContractState) -> (ContractAddress, u256) {
-        let mut eligible = array![];
-        let mut sum = 0_u256;
-        let len_u = self.user_list.len();
-        for i in 0_u64..len_u {
-            let addr: ContractAddress = self.user_list.at(i).read();
+            self.emit(PoolResetEvent {
+                reset_by: get_caller_address(),
+                users_affected: affected,
+                tickets_cleared: total_before,
+                timestamp: get_block_timestamp(),
+            });
+        }
 
-            let info: UserInfo = self.user_info.entry(addr).read();
-            if info.is_connected && info.tickets > 0 {
-                eligible.append(addr);
-                sum += info.tickets;
+        fn get_pool_stats(self: @ContractState) -> PoolStats {
+            let user_count = self.user_list.len();
+            let mut connected: u64 = 0;
+
+            let mut i: u64 = 0;
+            while i < user_count {
+                let user = self.user_list.at(i).read();
+                let info = self.users.entry(user).read();
+                if info.is_connected {
+                    connected += 1;
+                }
+                i += 1;
+            };
+
+            PoolStats {
+                total_tickets: self.total_tickets.read(),
+                total_users: user_count,
+                connected_users: connected,
+                total_draws: self.total_draws.read(),
             }
         }
 
-        assert!(sum > 0_u256, "No eligible tickets to draw");
+        fn set_draw_caller(ref self: ContractState, caller: ContractAddress, authorized: bool) {
+            assert_owner(@self);
 
-        let contract_addr = get_contract_address();
-        let vrf_provider = IVrfProviderDispatcher {
-            contract_address: self.vrf_contract_address.read(),
-        };
-        let random: u256 = vrf_provider.consume_random(Source::Nonce(contract_addr)).into();
-        let r: u256 = (random % sum).try_into().unwrap();
+            let mut info = self.draw_callers.entry(caller).read();
+            info.is_authorized = authorized;
+            self.draw_callers.entry(caller).write(info);
 
-        let mut cumulative = 0_u256;
-        let len_e = eligible.len();
-        let mut i_e = 0_u32;
-        let mut chosen: (ContractAddress, u256) = (self.owner.read(), 0_u256);
-        while i_e != len_e {
-            let addr: ContractAddress = *eligible.at(i_e);
-            let info: UserInfo = self.user_info.entry(addr).read();
-            cumulative += info.tickets;
-            if cumulative > r {
-                chosen = (addr, info.tickets);
-                break;
-            }
-            i_e += 1;
+            self.emit(DrawCallerEvent { caller, authorized });
         }
 
-        let (winner_addr, winner_tickets) = chosen;
-        assert!(winner_addr != self.owner.read() && winner_tickets != 0_u256, "No winner found");
+        fn is_draw_caller(self: @ContractState, caller: ContractAddress) -> bool {
+            self.draw_callers.entry(caller).read().is_authorized
+        }
 
-        self.winner_set.entry(winner_addr).write(true);
-        self.past_winners.push(winner_addr);
-
-        self.emit(DrawEvent { winner: winner_addr, tickets: winner_tickets });
-
-        (winner_addr, winner_tickets)
+        fn get_draw_caller_info(self: @ContractState, caller: ContractAddress) -> DrawCallerInfo {
+            self.draw_callers.entry(caller).read()
+        }
     }
 
     #[abi(embed_v0)]
-    impl CartridgeVRFOracle of ICartridgeVRF<ContractState> {
-        fn set_vrf_provider(ref self: ContractState, new_vrf_provider: ContractAddress) {
-            _only_owner(@self);
-            self.vrf_contract_address.write(new_vrf_provider);
+    impl CartridgeVRFImpl of ICartridgeVRF<ContractState> {
+        fn set_vrf_provider(ref self: ContractState, provider: ContractAddress) {
+            assert_owner(@self);
+            self.vrf_provider.write(provider);
         }
 
         fn get_vrf_provider(self: @ContractState) -> ContractAddress {
-            self.vrf_contract_address.read()
+            self.vrf_provider.read()
         }
+    }
+
+    /// Execute double-or-half spin for a user
+    fn execute_spin(ref self: ContractState, user: ContractAddress) -> bool {
+        let mut info = self.users.entry(user).read();
+
+        // Get randomness
+        let random = consume_vrf(@self);
+        let random_felt: felt252 = (random % 0x100000000_u256).try_into().unwrap();
+
+        // Even = win (double), Odd = lose (halve)
+        let won = (random.low & 1) == 0;
+
+        let old_tickets = info.tickets;
+        if won {
+            info.tickets *= 2;
+            self.total_tickets.write(self.total_tickets.read() + old_tickets);
+        } else {
+            info.tickets /= 2;
+            self.total_tickets.write(self.total_tickets.read() - old_tickets / 2);
+        }
+
+        info.has_spinned = true;
+        self.users.entry(user).write(info);
+
+        self.emit(DoubleOrHalveEvent {
+            user,
+            tickets: info.tickets,
+            won,
+            random_word: random_felt,
+        });
+
+        won
+    }
+
+    /// Execute weighted random draw to select a winner
+    fn execute_draw(ref self: ContractState) -> (ContractAddress, u256) {
+        // Build eligible list (connected users with tickets)
+        let mut eligible: Array<ContractAddress> = array![];
+        let mut eligible_sum: u256 = 0;
+
+        let user_count = self.user_list.len();
+        let mut i: u64 = 0;
+
+        while i < user_count {
+            let addr = self.user_list.at(i).read();
+            let info = self.users.entry(addr).read();
+
+            if info.is_connected && info.tickets > 0 {
+                eligible.append(addr);
+                eligible_sum += info.tickets;
+            }
+            i += 1;
+        };
+
+        assert!(eligible_sum > 0, "No eligible tickets");
+
+        // Get random value and compute target
+        let random = consume_vrf(@self);
+        let target: u256 = random % eligible_sum;
+
+        // Find winner using cumulative sum
+        let mut cumulative: u256 = 0;
+        let eligible_len = eligible.len();
+        let mut j: u32 = 0;
+        let mut winner = (self.owner.read(), 0_u256);  // Fallback
+
+        while j < eligible_len {
+            let addr = *eligible.at(j);
+            let info = self.users.entry(addr).read();
+            cumulative += info.tickets;
+
+            if cumulative > target {
+                winner = (addr, info.tickets);
+                break;
+            }
+            j += 1;
+        };
+
+        let (winner_addr, winner_tickets) = winner;
+        assert!(winner_tickets > 0, "Draw failed: no winner selected");
+
+        // Record winner
+        self.winner_set.entry(winner_addr).write(true);
+        self.winners.push(winner_addr);
+
+        self.emit(DrawEvent {
+            winner: winner_addr,
+            tickets: winner_tickets
+        });
+
+        (winner_addr, winner_tickets)
     }
 }

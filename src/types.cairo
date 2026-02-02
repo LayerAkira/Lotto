@@ -1,20 +1,40 @@
 use starknet::ContractAddress;
 
-#[derive(Copy, Drop, Serde, starknet::Store, PartialEq)]
+/// User's participation state in the lottery
+#[derive(Copy, Drop, Serde, starknet::Store, PartialEq, Debug)]
 pub struct UserInfo {
-    pub tickets: u256, // number of tickets the user has
-    pub is_connected: bool, // indicates if the user has connected their wallet
-    pub has_spinned: bool // indicates if the user has already spun for double or nothing
+    pub tickets: u256,
+    pub is_connected: bool,
+    pub has_spinned: bool,
 }
 
-#[derive(Copy, Drop, Serde, starknet::Store, PartialEq)]
+/// Time window configuration for double-or-nothing feature
+#[derive(Copy, Drop, Serde, starknet::Store, PartialEq, Debug)]
 pub struct DoubleOrNothingConfig {
-    pub start: u64, // UTC in seconds when the double or nothing starts, 0 means disabled
-    pub end: u64 // UTC in seconds when the double or nothing ends, 0 means disabled
+    pub start: u64,  // UTC timestamp (seconds)
+    pub end: u64,    // UTC timestamp (seconds)
 }
 
+/// Batch operation input for ticket modifications
 #[derive(Copy, Drop, Serde)]
 pub struct UserTickets {
     pub user: ContractAddress,
     pub tickets: u256,
+}
+
+/// Statistics for authorized draw callers
+#[derive(Copy, Drop, Serde, starknet::Store, PartialEq, Debug)]
+pub struct DrawCallerInfo {
+    pub is_authorized: bool,
+    pub draw_count: u64,
+    pub last_draw_timestamp: u64,
+}
+
+/// Pool statistics snapshot
+#[derive(Copy, Drop, Serde, Debug)]
+pub struct PoolStats {
+    pub total_tickets: u256,
+    pub total_users: u64,
+    pub connected_users: u64,
+    pub total_draws: u64,
 }
